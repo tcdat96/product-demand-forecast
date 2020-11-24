@@ -3,7 +3,7 @@
 
 # # Product Demand Forecast
 
-# In[1]:
+# In[2]:
 
 
 import pandas as pd
@@ -17,25 +17,36 @@ import matplotlib as plt
 
 # ### Read input data
 
-# In[17]:
+# In[117]:
 
 
-demand_df = pd.read_csv('Historical Product Demand.csv')
-print('Original: ' + str(demand_df.shape))
+orig_demand_df = pd.read_csv('Historical Product Demand.csv')
+print('Original: ' + str(orig_demand_df.shape))
+orig_demand_df.head(4)
+
+
+# ### Data preprocessing
+
+# In[119]:
+
+
+# convert demand to int
+demand_df = orig_demand_df.copy()
+demand_df.Order_Demand = orig_demand_df.Order_Demand.str.replace('\(|\)', '').astype(int)
+# convert to datetime
+demand_df.Date = pd.to_datetime(demand_df.Date)
+# remove NA
 demand_df.dropna(inplace=True)
 print('After   : ' + str(demand_df.shape))
-demand_df.head(4)
 
 
-# In[29]:
+# A little summary for our data
+
+# In[143]:
 
 
 print('Date range: ({}, {})'.format(demand_df.Date.min(), demand_df.Date.max()))
-demand_df.describe()
+demand_df.drop('Date', axis=1).describe(include='all').iloc[:4,:]
 
 
-# In[ ]:
-
-
-
-
+# ### Generic plots
