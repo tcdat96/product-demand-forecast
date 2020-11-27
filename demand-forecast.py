@@ -3,7 +3,7 @@
 
 # # Product Demand Forecast
 
-# In[33]:
+# In[1]:
 
 
 import pandas as pd
@@ -25,7 +25,7 @@ from datetime import timedelta
 from tqdm.notebook import tqdm
 
 
-# In[27]:
+# In[2]:
 
 
 def print_elapsed_time(start):
@@ -39,7 +39,7 @@ def print_elapsed_time(start):
 
 # ### Read input data
 
-# In[2]:
+# In[3]:
 
 
 orig_demand_df = pd.read_csv('Historical Product Demand.csv')
@@ -51,7 +51,7 @@ orig_demand_df.head(4)
 
 # Use more compact and consistent column names
 
-# In[3]:
+# In[4]:
 
 
 demand_df = orig_demand_df.copy()
@@ -60,7 +60,7 @@ demand_df.columns = ['ID', 'Warehouse', 'Category', 'Date', 'Demand']
 
 # Then, Let's check for NAs
 
-# In[4]:
+# In[5]:
 
 
 demand_df.isna().sum()
@@ -68,7 +68,7 @@ demand_df.isna().sum()
 
 # As we can see, only date column has NAs. Since we literally have no way to figure out the missing date, we need to drop all of them.
 
-# In[5]:
+# In[6]:
 
 
 # remove NA
@@ -76,7 +76,7 @@ demand_df.dropna(inplace=True)
 print('After: ' + str(demand_df.shape))
 
 
-# In[6]:
+# In[7]:
 
 
 # convert demand to int
@@ -85,7 +85,7 @@ demand_df.Demand = demand_df.Demand.str.replace('\(|\)', '').astype(int)
 demand_df.Date = pd.to_datetime(demand_df.Date)
 
 
-# In[7]:
+# In[8]:
 
 
 # Remove redundant prefixes
@@ -95,7 +95,7 @@ demand_df.Category = [cat.split('_')[1] for cat in demand_df.Category]
 
 # convert the data to daily
 
-# In[8]:
+# In[9]:
 
 
 daily_demand_df = demand_df.groupby(['ID', 'Date', 'Category']).sum()
@@ -105,7 +105,7 @@ daily_demand_df
 
 # A little summary for our data
 
-# In[9]:
+# In[10]:
 
 
 def get_date_range(df, debugging=False):
@@ -116,7 +116,7 @@ def get_date_range(df, debugging=False):
     return date_range
 
 
-# In[10]:
+# In[11]:
 
 
 print('Date range: ')
@@ -126,13 +126,13 @@ daily_demand_df.drop('Date', axis=1).describe(include='all').iloc[:4,:]
 
 # ### Generic plots
 
-# In[11]:
+# In[12]:
 
 
 sns.set(rc={'figure.figsize':(15, 8)})
 
 
-# In[12]:
+# In[13]:
 
 
 # # sns.lineplot(data=demand_df, x='Date', y='Order_Demand', hue='Product_Category')
@@ -145,7 +145,7 @@ sns.set(rc={'figure.figsize':(15, 8)})
 # del cumsum_demand_df
 
 
-# In[13]:
+# In[14]:
 
 
 # demand_by_cat_df = demand_df.groupby('Product_Category').sum().reset_index()
@@ -155,7 +155,7 @@ sns.set(rc={'figure.figsize':(15, 8)})
 # del demand_by_cat_df, g
 
 
-# In[14]:
+# In[15]:
 
 
 # g = sns.boxplot(data=demand_df, y='Order_Demand', x='Product_Category', showfliers=True)
@@ -163,7 +163,7 @@ sns.set(rc={'figure.figsize':(15, 8)})
 # del g
 
 
-# In[15]:
+# In[16]:
 
 
 # g = sns.boxplot(data=demand_df, y='Order_Demand', x='Warehouse', showfliers=True)
@@ -173,7 +173,7 @@ sns.set(rc={'figure.figsize':(15, 8)})
 
 # ### Split dataset
 
-# In[16]:
+# In[17]:
 
 
 train_df, test_df = train_test_split(daily_demand_df, test_size=0.1)
@@ -181,11 +181,11 @@ print('Train: {}'.format(train_df.shape))
 print('Test : {}'.format(test_df.shape))
 
 
-# ## ARIMA
+# ## Exploratory time-series analysis
 
-# ### Check for stationarity
+# ### Stationarity check
 
-# In[17]:
+# In[18]:
 
 
 # simple function to filter dataframe with given parameters
@@ -200,7 +200,7 @@ def filter_demand(df, ID=None, category=None, Demand=-1):
     return df
 
 
-# In[18]:
+# In[19]:
 
 
 def is_stationary(df, print_stats=False):
@@ -213,7 +213,7 @@ def is_stationary(df, print_stats=False):
 
 # Check stationarity of 100 items with highest frequency
 
-# In[19]:
+# In[20]:
 
 
 n = 100
@@ -228,7 +228,7 @@ print('{}/{} are not stationary'.format(len(not_stationary), n))
 
 # Only one of them is not stationary. Let's write a simple function to apply differencing.
 
-# In[20]:
+# In[21]:
 
 
 import warnings
@@ -244,7 +244,7 @@ def apply_differencing(df, periods=1, ffill=False, stationary_check=True):
     return df
 
 
-# In[21]:
+# In[22]:
 
 
 not_stationary = []
@@ -257,36 +257,42 @@ print('{}/{} are not stationary'.format(len(not_stationary), n))
 
 # Okay, now we have the function, we only need to call it when we build the model.
 
-# ### Finding right parameters
+# ## Finding correlation  
 
-# In[22]:
-
-
-train_date_range = get_date_range(train_df, debugging=True)
-
+# First, since we're dealing with one product at a time, we need a simple function to filter dataset based on product code (ID). Since a lot of days will have no demand for that particulat product, we need to fill those missing dates with 0.
 
 # In[23]:
 
 
+# a simple function to get appropriate training data
 def get_train_data(df, date_range=None, differencing=0):
+    # we don't need these columns now
     df = df.drop(columns=['ID', 'Category'])
+    
     df = df.set_index('Date')
     
-    # fill date gap
+    # fill date gap with 0
     if date_range is not None:
         idx = pd.date_range(*date_range)
         df = df.reindex(idx, fill_value=0)
         
+    # apply diffencing of 0
     if differencing > 0:
         df = apply_differencing(df, periods=differencing)
     
     return df
 
 
+# Next, we need a specific product to find out the correlation
+# 
+# **Clarification**: Each product's demand might be completely different from each other, so the correlation of one product might not hold true to others, eventually produces inaccurate results. In this project, I will only consider products with high demand, e.g. staples, so there will be high chance that they have similar correlation.
+
 # In[24]:
 
 
+# getting the item with highest demand
 highest_freq_item_df = filter_demand(train_df, ID=str(check_ids[0]))
+train_date_range = get_date_range(train_df, debugging=True)
 item_df = get_train_data(highest_freq_item_df, train_date_range)
 item_diff_df = get_train_data(highest_freq_item_df, train_date_range, differencing=True)
 del highest_freq_item_df
@@ -295,28 +301,38 @@ del highest_freq_item_df
 # In[25]:
 
 
-fig, ax = plt.subplots(1,2, figsize=(10,4))
+fig, ax = plt.subplots(1, 4, figsize=(18,4))
 lags = 30
-sm.graphics.tsa.plot_acf(item_diff_df, lags=lags, ax=ax[0], title='Autocorrelation')
-sm.graphics.tsa.plot_pacf(item_diff_df, lags=lags, ax=ax[1], title='Partial autocorrelation')
+sm.graphics.tsa.plot_acf(item_df, lags=lags, ax=ax[0], title='Autocorrelation')
+sm.graphics.tsa.plot_pacf(item_df, lags=lags, ax=ax[1], title='Partial autocorrelation')
+sm.graphics.tsa.plot_acf(item_diff_df, lags=lags, ax=ax[2], title='Autocorrelation')
+sm.graphics.tsa.plot_pacf(item_diff_df, lags=lags, ax=ax[3], title='Partial autocorrelation')
 pass
 
 
-# It's 
+# As expected, the data have both daily and weekly seasonality.
+# 
+# In this project, I will use **_TBATS_**, a method specifically designed to handle datasets with multiple seasonalities. The traditional **_SARIMA_** model will also be conducted to compare the results.
 
-# In[40]:
+# ## SARIMA
+# 
+# ### Finding right parameters
+
+# In[26]:
 
 
 from sklearn.utils.testing import ignore_warnings
 from sklearn.exceptions import ConvergenceWarning
 
 def_range = range(0,4)
+
 @ignore_warnings(category=ConvergenceWarning)
 def optimize_SARIMA(df, p_range=def_range, d=1, q_range=def_range,                     P_range=def_range, D=1, Q_range=def_range, s_range=def_range):   
     results = []
     best_aic = float('inf')
     
     params = list(product(p_range, q_range, P_range, Q_range, s_range))
+    warnings.simplefilter("ignore")
     for param in tqdm(params):
         try: model = SARIMAX(df, order=(param[0], d, param[1]),
                              seasonal_order=(param[2], D, param[3], param[4])).fit(disp=-1)
@@ -331,17 +347,17 @@ def optimize_SARIMA(df, p_range=def_range, d=1, q_range=def_range,              
     return results.reset_index(drop=True)
 
 
-# In[37]:
+# In[ ]:
 
 
 start_time = time()
 d = 1
 D = 0
-tried_models = optimize_SARIMA(item_df, d=d, D=D)
+tried_models = optimize_SARIMA(item_df, d=d, D=D, s_range=(1,2,5,7))
 print_elapsed_time(start_time)
 
 
-# In[45]:
+# In[ ]:
 
 
 tried_models[:5]
@@ -349,7 +365,7 @@ tried_models[:5]
 
 # So, we have the params for our SARIMA model now
 
-# In[47]:
+# In[ ]:
 
 
 best_model = tried_models.param[0]
@@ -362,10 +378,10 @@ seasonal_order = (best_model[2], D, best_model[3], best_model[4])
 # In[ ]:
 
 
-train_ratio = 0.1
-train_df, test_df = train_test_split(daily_demand_df, test_size=0.1)
-print('Train: {}'.format(train_df.shape))
-print('Test : {}'.format(test_df.shape))
+# train_ratio = 0.1
+# train_df, test_df = train_test_split(daily_demand_df, test_size=0.1)
+# print('Train: {}'.format(train_df.shape))
+# print('Test : {}'.format(test_df.shape))
 
 
 # In[ ]:
