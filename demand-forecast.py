@@ -173,10 +173,10 @@ sns.set(rc={'figure.figsize':(15, 8)})
 
 # ### Split dataset
 
-# In[17]:
+# In[92]:
 
 
-train_df, test_df = train_test_split(daily_demand_df, test_size=0.1)
+train_df, test_df = train_test_split(daily_demand_df, test_size=0.1, shuffle=False)
 print('Train: {}'.format(train_df.shape))
 print('Test : {}'.format(test_df.shape))
 
@@ -347,7 +347,7 @@ def optimize_SARIMA(df, p_range=def_range, d=1, q_range=def_range,              
     return results.reset_index(drop=True)
 
 
-# In[ ]:
+# In[27]:
 
 
 start_time = time()
@@ -357,7 +357,7 @@ tried_models = optimize_SARIMA(item_df, d=d, D=D, s_range=(1,2,5,7))
 print_elapsed_time(start_time)
 
 
-# In[ ]:
+# In[28]:
 
 
 tried_models[:5]
@@ -365,7 +365,7 @@ tried_models[:5]
 
 # So, we have the params for our SARIMA model now
 
-# In[ ]:
+# In[29]:
 
 
 best_model = tried_models.param[0]
@@ -375,23 +375,36 @@ seasonal_order = (best_model[2], D, best_model[3], best_model[4])
 
 # ### Build SARIMA model
 
-# In[ ]:
+# In[152]:
 
 
-# train_ratio = 0.1
-# train_df, test_df = train_test_split(daily_demand_df, test_size=0.1)
-# print('Train: {}'.format(train_df.shape))
-# print('Test : {}'.format(test_df.shape))
+def pred_demand_sarima(train_df, test_df, train_inst_min=None):
+    warnings.simplefilter("ignore")
+
+    IDs = test_df.ID.value_counts().index
+    if train_inst_min is None:
+        train_inst_min = 0
+    
+    pred = {}
+    for ID in tqdm(IDs):
+        # train data
+        item_train_df = filter_demand(train_df, ID=ID)
+        if isinstance(train_inst_min, int) and len(item_train_df) < train_inst_min:
+            continue
+        item_train_df = get_train_data(item_train_df, train_date_range)
+        try: model = SARIMAX(df, order=order, seasonal_order=seasonal_order).fit(disp=-1)
+        except: continue
+        # predict
+        pred[str(ID)] = model.forecast(196).reset_index(drop=True)
+        if len(pred) > 5: break
+        
+    return pred
 
 
-# In[ ]:
+# In[153]:
 
 
+pred = pred_demand_sarima(train_df, test_df, 1100)
 
 
-
-# In[ ]:
-
-
-
-
+# 
