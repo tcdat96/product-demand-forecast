@@ -19,7 +19,7 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 from tbats import TBATS, BATS
 
 from itertools import product 
-from ast import literal_eval as make_tuple
+from ast import literal_eval
 
 from time import time
 from datetime import timedelta
@@ -32,6 +32,9 @@ from pathlib import Path
 
 from tqdm import tqdm
 import warnings
+
+
+PROCESS_COUNT = 8
 
 
 def print_elapsed_time(start):
@@ -109,7 +112,7 @@ def check_stationary(df, items, differencing=False):
         items_df.append(item_df)
 
     result = []
-    with Pool(4) as p:
+    with Pool(PROCESS_COUNT) as p:
         result = list(tqdm(p.imap(is_stationary, items_df), total=len(items_df)))
     return result
 
@@ -132,21 +135,42 @@ def get_train_data(df, date_range=None, differencing=0):
     
     return df
 
+def _get_fft_terms(df, periods=0):
+    date_range = get_date_range(df)
+    date_range = pd.date_range(start=date_range[0], end=date_range[1] + timedelta(days=periods))
 
-def test_model_sarima(df, param):
+    exog = pd.DataFrame({'date': date_range})
+    exog = exog.set_index(pd.DatetimeIndex(exog['date'], freq='D'))
+    exog['sin365'] = np.sin(2 * np.pi * exog.index.dayofyear / 365.25)
+    exog['cos365'] = np.cos(2 * np.pi * exog.index.dayofyear / 365.25)
+    exog['sin365_2'] = np.sin(4 * np.pi * exog.index.dayofyear / 365.25)
+    exog['cos365_2'] = np.cos(4 * np.pi * exog.index.dayofyear / 365.25)
+    exog = exog.drop(columns=['date'])
+
+    exog_to_train = exog.iloc[:-periods] if periods != 0 else exog
+    exog_to_test = exog.iloc[-periods:] if periods != 0 else None
+    return exog_to_train, exog_to_test
+
+
+def test_model_sarima(df, param, exog=None):
     warnings.simplefilter("ignore")
     try: 
-        model = SARIMAX(df, order=param[0], seasonal_order=param[1])
+        model = SARIMAX(df, order=param[0], seasonal_order=param[1], exog=exog)
         model = model.fit(disp=-1)
-    except: return
+    except Exception as e: 
+        # print(e)
+        return
     return [param, model.aic]
 
-def_range = range(0,4)
+
+def_range = range(0, 4)
+def_s_range = (1, 2, 5, 7)
 @ignore_warnings(category=ConvergenceWarning)
-def optimize_SARIMA(df, p_range=def_range, d=1, q_range=def_range, P_range=def_range, D=1, Q_range=def_range, s_range=def_range):   
+def optimize_SARIMA(df, p_range=def_range, d=1, q_range=def_range, P_range=def_range, D=1, 
+                    Q_range=def_range, s_range=def_s_range, fft=False, multiprocessing=False):   
     results = []
     best_aic = float('inf')
-    
+
     def _get_sarima_param(param):
         order = (param[0], d, param[1])
         seasonal_order = (param[2], D, param[3], param[4])
@@ -155,13 +179,21 @@ def optimize_SARIMA(df, p_range=def_range, d=1, q_range=def_range, P_range=def_r
     params = list(product(p_range, q_range, P_range, Q_range, s_range))
     params = [_get_sarima_param(param) for param in params]
     
+    exog_to_train, _ = _get_fft_terms(df) if fft else None
+
     results = []
-    with Pool(4) as pool:
-        mp_param = functools.partial(test_model_sarima, df)
-        results = list(tqdm(pool.imap(mp_param, params), total=len(params)))
-        results = [result for result in results if result is not None]
-    results = pd.DataFrame(results, columns=['param', 'aic']).sort_values('aic')
-    
+    if multiprocessing:
+        with Pool(PROCESS_COUNT) as pool:
+            mp_param = functools.partial(test_model_sarima, df, exog=exog_to_train)
+            results = list(tqdm(pool.imap(mp_param, params, chunksize=10), total=len(params)))
+            results = [result for result in results if result is not None]
+    else:
+        for param in tqdm(params):
+            result = test_model_sarima(df, param, exog_to_train)
+            if result is not None:
+                results.append(result)
+
+    results = pd.DataFrame(results, columns=['param', 'aic']).sort_values('aic')    
     return results.reset_index(drop=True)
 
 
@@ -178,7 +210,7 @@ def pred_demand_by(model_func, forecast_steps, train_inst_min, kwargs, param):
     return [*param, pred]
         
 
-def pred_demands(train_df, test_df, model_func, forecast_steps=196, train_inst_min=None, multiprocessing=True, kwargs={}):
+def pred_demands(train_df, test_df, model_func, forecast_steps=196, train_inst_min=None, multiprocessing=False, kwargs={}):
     unique_items = test_df.item.unique()
     unique_stores = test_df.store.unique()
     combinations = list(product(test_df.store.unique(), test_df.item.unique()))
@@ -188,12 +220,12 @@ def pred_demands(train_df, test_df, model_func, forecast_steps=196, train_inst_m
 
     preds = []
     if multiprocessing:
-        with Pool(4) as p:
+        with Pool(PROCESS_COUNT) as p:
             mp_param = functools.partial(pred_demand_by, model_func, forecast_steps, train_inst_min, kwargs)
             preds = list(tqdm(p.imap(mp_param, combinations), total=len(combinations)))
     else:
         for combination in tqdm(combinations):
-            pred = pred_demand_by(model_func, forecast_steps, train_inst_min, combination, kwargs)
+            pred = pred_demand_by(model_func, forecast_steps, train_inst_min, kwargs, combination)
             preds.append(pred)
 
     # convert to DataFrame
@@ -203,13 +235,17 @@ def pred_demands(train_df, test_df, model_func, forecast_steps=196, train_inst_m
 
 
 def model_sarima(df, steps, kwargs):
+    exog_to_train, exog_to_test = None, None
+    if 'fft' in kwargs and kwargs['fft']:
+        exog_to_train, exog_to_test = _get_fft_terms(df, steps)
+
     # train
     try: 
-        model = SARIMAX(df, order=kwargs['order'], seasonal_order=kwargs['seasonal_order'])
+        model = SARIMAX(df, order=kwargs['order'], seasonal_order=kwargs['seasonal_order'], exog=exog_to_train)
         model = model.fit(disp=-1)
     except: return None
     # predict
-    return model.forecast(steps).reset_index(drop=True)        
+    return model.forecast(steps, exog=exog_to_test).reset_index(drop=True)        
 
 
 
@@ -217,6 +253,27 @@ def model_tbats(train_df, steps, kwargs):
     estimator = TBATS(seasonal_periods=(7, 365.25), n_jobs=1)
     model = estimator.fit(train_df)
     return model.forecast(steps=steps)
+
+
+
+def add_new_features(df):
+    df = df.set_index('date')
+    df['weekday'] = df.index.dayofweek
+    df['is_weekend'] = df['weekday'] >= 4
+    df['day'] = df.index.day
+    df['month'] = df.index.month
+    df['quarter'] = (df.month - 1) / 3
+    df['year'] = df.index.year
+
+    # 12 month lag
+    prior_year_sales = df.reset_index()[['date','sales','store','item']]
+    prior_year_sales['date'] += pd.Timedelta('365 days')
+    prior_year_sales.columns = ['date','12m_lag','store','item']
+    df = df.merge(prior_year_sales, on=['date','store','item'])
+
+    # is holiday or not
+    holidays = USFederalHolidayCalendar().holidays(start=df.index.min(), end=df.index.max())
+    df['holiday'] = df.index.isin(holidays)
 
 
 
@@ -251,10 +308,6 @@ if __name__ == "__main__":
     date_range = get_date_range(train_df, debugging=True)
     train_df.drop('date', axis=1).describe(include='all').iloc[:4,:]
 
-
-    # ### Split dataset
-    test_df = pd.read_csv('dataset/demand-forecasting-kernels-only/test.csv', index_col='id')
-    test_df
 
 
     # ## Exploratory time-series analysis
@@ -307,41 +360,69 @@ if __name__ == "__main__":
     d = 1
     D = 0
 
-    tried_params_filepath = "sarima_params_gridsearch.csv"
+    tried_params_filepath = "sarima_params.csv"
     if Path(tried_params_filepath).is_file():
         print('Reading from {}...'.format(tried_params_filepath))
         tried_models = pd.read_csv(tried_params_filepath)
+        tried_models.param = tried_models.param.apply(lambda param: literal_eval(param))
     else:
-        print('{} does not exist. Running SARIMA grid search...'.format(tried_params_filepath))
-        start_time = time()
-        tried_models = optimize_SARIMA(item_df, d=d, D=D, s_range=(1, 2, 5, 7))
+        print('{} does not exist. Finding best SARIMA model...'.format(tried_params_filepath))
+        tried_models = optimize_SARIMA(item_df, d=d, D=D)
         tried_models.to_csv(tried_params_filepath, index=False)
-        print_elapsed_time(start_time)
-
-
-    print('Parameters of best SARIMA models:')
-    # print(tried_models[:5])
 
 
     # So, we have the params for our SARIMA model now
-    best_model = make_tuple(tried_models.param[0])
-    best_model_param = {'order': (best_model[0], d, best_model[1]), \
-                        'seasonal_order': (best_model[2], D, best_model[3], best_model[4])}
-    print(best_model_param)
+    print('Parameters of best SARIMA model:')
+    order, seasonal_order = tried_models.param[0]
+    sarima_param = {'order': order, 'seasonal_order': seasonal_order}
+    print(sarima_param)
+
 
     # ### Build SARIMA model
-    test_size = calc_datetime_delta(*get_date_range(test_df))
-
     sarima_pred_filepath = 'sarima_prediction.csv'
     if Path(sarima_pred_filepath).is_file():
         print('Reading from {}...'.format(sarima_pred_filepath))
-        pred_tbats = pd.read_csv(sarima_pred_filepath)
+        pred_sarima = pd.read_csv(sarima_pred_filepath)
+        pred_sarima.pred = pred_sarima.pred.apply(lambda pred: np.fromstring(pred, dtype=float, sep=' '))
     else:
         print('{} does not exist. Running SARIMA...'.format(sarima_pred_filepath))
-        start_time = time()
-        pred_sarima = pred_demands(train_df, test_df, model_sarima, 365, kwargs=best_model_param)
+        pred_sarima = pred_demands(train_df, test_df, model_sarima, 365, kwargs=sarima_param)
         pred_sarima.to_csv(sarima_pred_filepath, index=False)
-        print_elapsed_time(start_time)
+
+
+
+    # SARIMA model with FFT
+    sarima_fft_params_filepath = "sarima_fft_params.csv"
+    if Path(sarima_fft_params_filepath).is_file():
+        print('Reading from {}...'.format(sarima_fft_params_filepath))
+        tried_models = pd.read_csv(sarima_fft_params_filepath)
+        tried_models.param = tried_models.param.apply(lambda param: literal_eval(param))
+    else:
+        print('{} does not exist. Finding best SARIMA with FFT model...'.format(sarima_fft_params_filepath))
+        tried_models = optimize_SARIMA(item_df, d=d, D=D, fft=True, multiprocessing=True)
+        tried_models.to_csv(sarima_fft_params_filepath, index=False)
+
+
+    print('Parameters of best SARIMA with FFT:')
+    order, seasonal_order = tried_models.param[0]
+    sarima_fft_param = {'order': order, 'seasonal_order': seasonal_order}
+    print(sarima_fft_param)
+
+
+    sarima_fft_pred_filepath = 'sarima_fft_prediction.csv'
+    if Path(sarima_fft_pred_filepath).is_file():
+        print('Reading from {}...'.format(sarima_fft_pred_filepath))
+        pred_sarima_fft = pd.read_csv(sarima_fft_pred_filepath)
+        pred_sarima_fft.pred = pred_sarima_fft.pred.apply(lambda pred: np.fromstring(pred, dtype=float, sep=' '))
+    else:
+        print('{} does not exist. Running SARIMA with FFT...'.format(sarima_fft_pred_filepath))
+        # indicate Fft transformation
+        sarima_fft_param = sarima_param.copy()
+        sarima_fft_param['fft'] = True
+        # train model
+        pred_sarima_fft = pred_demands(train_df, test_df, model_sarima, 365, kwargs=sarima_fft_param)
+        pred_sarima_fft.to_csv(sarima_fft_pred_filepath, index=False)
+
 
 
     # ## TBATS
@@ -350,10 +431,39 @@ if __name__ == "__main__":
     if Path(tbats_pred_filepath).is_file():
         print('Reading from {}...'.format(tbats_pred_filepath))
         pred_tbats = pd.read_csv(tbats_pred_filepath)
+        pred_tbats.pred = pred_tbats.pred.apply(lambda pred: np.fromstring(pred, dtype=float, sep=' '))
     else:
         print('{} does not exist. Running TBATS...'.format(tbats_pred_filepath))
-        start_time = time()
         # apparently, tbats already uses multiprocessing underneath
         pred_tbats = pred_demands(train_df, test_df, model_tbats, 365, multiprocessing=True) 
         pred_tbats.to_csv(tbats_pred_filepath, index=False)
-        print_elapsed_time(start_time)
+
+
+
+    # testing
+    submissions_filepath = 'submissions.csv'
+    if not Path(submissions_filepath).is_file():
+        # read the test file
+        test_df = pd.read_csv('dataset/demand-forecasting-kernels-only/test.csv', index_col='id')
+        test_size = calc_datetime_delta(*get_date_range(test_df))
+        test_df.date = pd.to_datetime(test_df.date)
+        first_test_date = test_df.date.min()
+
+        #TODO: consider refactoring this
+        # iterate each test case, and find its prediction
+        pred_dfs = {'sarima': pred_sarima, 'sarima_fft': pred_sarima_fft, 'tbats': pred_tbats}
+        def combine_prediction(row):
+            index = (row.date - first_test_date).days
+            result = []
+            for name, pred_df in pred_dfs.items():
+                df = filter_demand(pred_df, store=row.store, item=row['item'])
+                result.append(df.pred.values[0][index])
+            return result
+
+        # distribute the workload
+        with Pool(PROCESS_COUNT) as p:
+            rows_iter = (row for _, row in test_df.iterrows())
+            submissions = list(tqdm(p.imap(combine_prediction, rows_iter), total=test_df.shape[0]))
+            submissions = pd.DataFrame(submissions, columns=pred_dfs.keys())
+            submissions.index.name = 'id'
+            submissions.to_csv(submissions_filepath)
