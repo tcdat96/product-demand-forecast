@@ -18,10 +18,14 @@ import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
+from tbats import TBATS, BATS
+
 from itertools import product 
 
 from time import time
 from datetime import timedelta
+from datetime import datetime
+
 from tqdm.notebook import tqdm
 
 
@@ -35,104 +39,122 @@ def print_elapsed_time(start):
     print('Elapsed time: {}'.format(elapsed))
 
 
+# In[3]:
+
+
+def calc_datetime_delta(d1, d2, date_format='%Y-%m-%d'):
+    d1 = datetime.strptime(d1, date_format)
+    d2 = datetime.strptime(d2, date_format)
+    delta = d2 - d1
+    return delta.days
+
+
 # ## Explore data
 
 # ### Read input data
 
-# In[3]:
+# In[4]:
 
 
-orig_demand_df = pd.read_csv('Historical Product Demand.csv')
-print('Original: ' + str(orig_demand_df.shape))
-orig_demand_df.head(4)
+orig_train_df = pd.read_csv('dataset/demand-forecasting-kernels-only/train.csv')
+print('Original: ' + str(orig_train_df.shape))
+orig_train_df
 
 
 # ### Data preprocessing
 
 # Use more compact and consistent column names
 
-# In[4]:
+# In[5]:
 
 
-demand_df = orig_demand_df.copy()
-demand_df.columns = ['ID', 'Warehouse', 'Category', 'Date', 'Demand']
+train_df = orig_train_df.copy()
+train_df.columns = ['date', 'store', 'item', 'sales']
 
 
 # Then, Let's check for NAs
 
-# In[5]:
+# In[6]:
 
 
-demand_df.isna().sum()
+train_df.isna().sum()
 
 
 # As we can see, only date column has NAs. Since we literally have no way to figure out the missing date, we need to drop all of them.
 
-# In[6]:
-
-
-# remove NA
-demand_df.dropna(inplace=True)
-print('After: ' + str(demand_df.shape))
-
-
-# In[7]:
-
-
-# convert demand to int
-demand_df.Demand = demand_df.Demand.str.replace('\(|\)', '').astype(int)
-# convert to datetime
-demand_df.Date = pd.to_datetime(demand_df.Date)
-
-
-# In[8]:
-
-
-# Remove redundant prefixes
-demand_df.ID = [cat.split('_')[1] for cat in demand_df.ID]
-demand_df.Category = [cat.split('_')[1] for cat in demand_df.Category]
-
-
-# convert the data to daily
-
 # In[9]:
 
 
-daily_demand_df = demand_df.groupby(['ID', 'Date', 'Category']).sum()
-daily_demand_df = daily_demand_df.reset_index().sort_values(['Date', 'ID'])
-daily_demand_df
+# remove NA
+train_df.dropna(inplace=True)
+print('After: ' + str(train_df.shape))
 
-
-# A little summary for our data
 
 # In[10]:
 
 
+# # convert demand to int
+# train_df.sales = demand_df.Demand.str.replace('\(|\)', '').astype(int)
+# # convert to datetime
+# demand_df.Date = pd.to_datetime(demand_df.Date)
+
+
+# In[11]:
+
+
+# # Remove redundant prefixes
+# demand_df.ID = [cat.split('_')[1] for cat in demand_df.ID]
+# demand_df.Category = [cat.split('_')[1] for cat in demand_df.Category]
+
+
+# convert the data to daily
+
+# In[12]:
+
+
+def group_demand_by(df, columns):
+    df = df.groupby(columns).sum()
+    df = df.reset_index().sort_values(columns)
+    return df
+
+
+# In[13]:
+
+
+train_df = group_demand_by(train_df, ['date', 'item', 'store'])
+train_df
+
+
+# A little summary for our data
+
+# In[14]:
+
+
 def get_date_range(df, debugging=False):
-    dates = df.Date if 'Date' in df.columns else df.index
+    dates = df.date if 'date' in df.columns else df.index
     date_range = (dates.min(), dates.max())
     if debugging:
         print('({} - {})'.format(*date_range))
     return date_range
 
 
-# In[11]:
+# In[15]:
 
 
 print('Date range: ')
-date_range = get_date_range(daily_demand_df, debugging=True)
-daily_demand_df.drop('Date', axis=1).describe(include='all').iloc[:4,:]
+date_range = get_date_range(train_df, debugging=True)
+train_df.drop('date', axis=1).describe(include='all').iloc[:4,:]
 
 
 # ### Generic plots
 
-# In[12]:
+# In[16]:
 
 
 sns.set(rc={'figure.figsize':(15, 8)})
 
 
-# In[13]:
+# In[ ]:
 
 
 # # sns.lineplot(data=demand_df, x='Date', y='Order_Demand', hue='Product_Category')
@@ -145,7 +167,7 @@ sns.set(rc={'figure.figsize':(15, 8)})
 # del cumsum_demand_df
 
 
-# In[14]:
+# In[ ]:
 
 
 # demand_by_cat_df = demand_df.groupby('Product_Category').sum().reset_index()
@@ -155,7 +177,7 @@ sns.set(rc={'figure.figsize':(15, 8)})
 # del demand_by_cat_df, g
 
 
-# In[15]:
+# In[ ]:
 
 
 # g = sns.boxplot(data=demand_df, y='Order_Demand', x='Product_Category', showfliers=True)
@@ -163,7 +185,7 @@ sns.set(rc={'figure.figsize':(15, 8)})
 # del g
 
 
-# In[16]:
+# In[ ]:
 
 
 # g = sns.boxplot(data=demand_df, y='Order_Demand', x='Warehouse', showfliers=True)
@@ -173,34 +195,44 @@ sns.set(rc={'figure.figsize':(15, 8)})
 
 # ### Split dataset
 
-# In[92]:
+# In[17]:
 
 
-train_df, test_df = train_test_split(daily_demand_df, test_size=0.1, shuffle=False)
-print('Train: {}'.format(train_df.shape))
-print('Test : {}'.format(test_df.shape))
+test_df = pd.read_csv('dataset/demand-forecasting-kernels-only/test.csv', index_col='id')
+# test_df = group_demand_by(test_df, ['date', 'item'])
+test_df
+
+
+# In[18]:
+
+
+# train_df, test_df = train_test_split(daily_demand_df, test_size=0.1, shuffle=False)
+# print('Train: {}'.format(train_df.shape))
+# print('Test : {}'.format(test_df.shape))
 
 
 # ## Exploratory time-series analysis
 
 # ### Stationarity check
 
-# In[18]:
+# In[19]:
 
 
 # simple function to filter dataframe with given parameters
-def filter_demand(df, ID=None, category=None, Demand=-1):
+def filter_demand(df, item=None, store=None, category=None, sales=-1):
     df = df.copy()
-    if ID is not None:
-        df = df[df.ID == ID]
+    if item is not None:
+        df = df[df.item == item]
+    if store is not None:
+        df = df[df.store == store]
     if category is not None:
         df = df[df.category == category]
-    if Demand > -1:
-        df = df[df.Demand > Demand]
+    if sales > -1:
+        df = df[df.sales > sales]
     return df
 
 
-# In[19]:
+# In[20]:
 
 
 def is_stationary(df, print_stats=False):
@@ -213,45 +245,47 @@ def is_stationary(df, print_stats=False):
 
 # Check stationarity of 100 items with highest frequency
 
-# In[20]:
+# In[22]:
 
 
-n = 100
-check_ids = daily_demand_df.ID.value_counts().index[:n]
+check_items = train_df.item.value_counts().index
+n = min(100, len(check_items))
+check_items = check_items[:n]
+
 not_stationary = []
-for check_id in tqdm(check_ids):
-    df = filter_demand(daily_demand_df, ID=str(check_id)).Demand
+for check_item in tqdm(check_items):
+    df = filter_demand(train_df, item=check_item).sales
     if not is_stationary(df):
-        not_stationary.append(check_id)
+        not_stationary.append(check_items)
 print('{}/{} are not stationary'.format(len(not_stationary), n))
 
 
 # Only one of them is not stationary. Let's write a simple function to apply differencing.
 
-# In[21]:
+# In[23]:
 
 
 import warnings
 def apply_differencing(df, periods=1, ffill=False, stationary_check=True):
-    if isinstance(df, pd.DataFrame) and 'Demand' in df.columns:
-        df.Demand = df.Demand.diff(periods=periods)
+    if isinstance(df, pd.DataFrame) and 'sales' in df.columns:
+        df.sales = df.sales.diff(periods=periods)
     else:
         df = df.diff(periods=periods)
     df = df.ffill() if ffill else df.dropna()
         
-    if stationary_check and not is_stationary(df.Demand if isinstance(df, pd.DataFrame) else df):
+    if stationary_check and not is_stationary(df.sales if isinstance(df, pd.DataFrame) else df):
         warnings.warn('DataFrame is still not stationary.')
     return df
 
 
-# In[22]:
+# In[24]:
 
 
 not_stationary = []
-for check_id in tqdm(check_ids):
-    df = filter_demand(daily_demand_df, ID=str(check_id)).Demand
+for check_item in tqdm(check_items):
+    df = filter_demand(train_df, item=check_item).sales
     if not is_stationary(apply_differencing(df)):
-        not_stationary.append(check_id)
+        not_stationary.append(check_item)
 print('{}/{} are not stationary'.format(len(not_stationary), n))
 
 
@@ -261,15 +295,15 @@ print('{}/{} are not stationary'.format(len(not_stationary), n))
 
 # First, since we're dealing with one product at a time, we need a simple function to filter dataset based on product code (ID). Since a lot of days will have no demand for that particulat product, we need to fill those missing dates with 0.
 
-# In[23]:
+# In[25]:
 
 
 # a simple function to get appropriate training data
 def get_train_data(df, date_range=None, differencing=0):
     # we don't need these columns now
-    df = df.drop(columns=['ID', 'Category'])
+    df = df.drop(columns=['store', 'item'])
     
-    df = df.set_index('Date')
+    df = df.set_index('date')
     
     # fill date gap with 0
     if date_range is not None:
@@ -287,18 +321,18 @@ def get_train_data(df, date_range=None, differencing=0):
 # 
 # **Clarification**: Each product's demand might be completely different from each other, so the correlation of one product might not hold true to others, eventually produces inaccurate results. In this project, I will only consider products with high demand, e.g. staples, so there will be high chance that they have similar correlation.
 
-# In[24]:
+# In[28]:
 
 
 # getting the item with highest demand
-highest_freq_item_df = filter_demand(train_df, ID=str(check_ids[0]))
+highest_freq_item_df = filter_demand(train_df, item=check_items[0], store=1)
 train_date_range = get_date_range(train_df, debugging=True)
 item_df = get_train_data(highest_freq_item_df, train_date_range)
 item_diff_df = get_train_data(highest_freq_item_df, train_date_range, differencing=True)
 del highest_freq_item_df
 
 
-# In[25]:
+# In[29]:
 
 
 fig, ax = plt.subplots(1, 4, figsize=(18,4))
@@ -310,7 +344,7 @@ sm.graphics.tsa.plot_pacf(item_diff_df, lags=lags, ax=ax[3], title='Partial auto
 pass
 
 
-# As expected, the data have both daily and weekly seasonality.
+# It is quite obvious that the item also has weekly seasonality.
 # 
 # In this project, I will use **_TBATS_**, a method specifically designed to handle datasets with multiple seasonalities. The traditional **_SARIMA_** model will also be conducted to compare the results.
 
@@ -318,7 +352,7 @@ pass
 # 
 # ### Finding right parameters
 
-# In[26]:
+# In[30]:
 
 
 from sklearn.utils.testing import ignore_warnings
@@ -347,7 +381,7 @@ def optimize_SARIMA(df, p_range=def_range, d=1, q_range=def_range,              
     return results.reset_index(drop=True)
 
 
-# In[27]:
+# In[ ]:
 
 
 start_time = time()
@@ -357,15 +391,22 @@ tried_models = optimize_SARIMA(item_df, d=d, D=D, s_range=(1,2,5,7))
 print_elapsed_time(start_time)
 
 
-# In[28]:
+# In[ ]:
 
 
 tried_models[:5]
 
 
+# In[ ]:
+
+
+# tried_models.to_csv('SARIMA_GridSearch.csv', index=False)
+# tried_models = pd.read_csv('SARIMA_GridSearch.csv')
+
+
 # So, we have the params for our SARIMA model now
 
-# In[29]:
+# In[ ]:
 
 
 best_model = tried_models.param[0]
@@ -375,36 +416,93 @@ seasonal_order = (best_model[2], D, best_model[3], best_model[4])
 
 # ### Build SARIMA model
 
-# In[152]:
+# In[63]:
 
 
-def pred_demand_sarima(train_df, test_df, train_inst_min=None):
+def pred_demand(train_df, test_df, model_func, forecast_steps=196, train_inst_min=None):
     warnings.simplefilter("ignore")
 
-    IDs = test_df.ID.value_counts().index
+    unique_items = test_df.item.unique()
+    unique_stores = test_df.store.unique()
+    combinations = list(product(test_df.store.unique(), test_df.item.unique()))
+    
     if train_inst_min is None:
         train_inst_min = 0
     
-    pred = {}
-    for ID in tqdm(IDs):
-        # train data
-        item_train_df = filter_demand(train_df, ID=ID)
+    preds = {}
+    for param in tqdm(combinations):
+        # get train data
+        item_train_df = filter_demand(train_df, item=param[1], store=param[0])
         if isinstance(train_inst_min, int) and len(item_train_df) < train_inst_min:
             continue
         item_train_df = get_train_data(item_train_df, train_date_range)
-        try: model = SARIMAX(df, order=order, seasonal_order=seasonal_order).fit(disp=-1)
-        except: continue
-        # predict
-        pred[str(ID)] = model.forecast(196).reset_index(drop=True)
-        if len(pred) > 5: break
+        # train and predict
+        pred = model_func(item_train_df, forecast_steps)
+        if pred is not None:
+            if str(param[0]) not in preds:
+                preds[str(param[0])] = {}
+            preds[str(param[0])][str(param[1])] = pred
+            pd.DataFrame(preds).to_csv('{}.csv'.format(model_func.__name__))
+#         if len(preds) > 0: break
         
-    return pred
+    return preds
 
 
-# In[153]:
+# In[41]:
 
 
-pred = pred_demand_sarima(train_df, test_df, 1100)
+def model_sarima(train_df, steps):
+    # train
+    try: 
+        model = SARIMAX(df, order=order, seasonal_order=seasonal_order).fit(disp=-1)
+    except: return None
+    # predict
+    return model.forecast(steps).reset_index(drop=True)        
 
 
+# In[ ]:
+
+
+test_size = calc_datetime_delta(*get_date_range(test_df))
+pred = pred_demand(train_df, test_df, model_sarima, 365, 1100)
+
+
+# ## TBATS
 # 
+# Trigonometric seasonality, Box-Cox transformation, ARMA errors, Trend and Seasonal components.
+
+# In[42]:
+
+
+def model_tbats(train_df, steps):
+    estimator = TBATS(seasonal_periods=(7, 365.25))
+    model = estimator.fit(train_df)
+    return model.forecast(steps=steps)
+
+
+# In[64]:
+
+
+pred_tbats = pred_demand(train_df, test_df, model_tbats, 365)
+
+
+# In[76]:
+
+
+pred_tbats = pd.read_csv('model_tbats.csv')
+pred = np.fromstring(pred_tbats['1'][0][1:-1].replace('\n', ' '), dtype=float, sep=' ')
+sns.lineplot(data=pred)
+
+
+# In[ ]:
+
+
+item = next(iter(pred_tbats.keys()))
+sns.lineplot(data=train_df[train_df.item == int(item)].sales[-400:])
+
+
+# In[ ]:
+
+
+sns.lineplot(data=pred_tbats[item])
+
