@@ -8,6 +8,8 @@ import numpy as np
 
 from sklearn.utils._testing import ignore_warnings
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.preprocessing import OneHotEncoder
+import joblib
 
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -18,12 +20,15 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 from tbats import TBATS, BATS
 
+from xgboost import XGBRegressor
+
 from itertools import product 
 from ast import literal_eval
 
 from time import time
 from datetime import timedelta
 from datetime import datetime
+from pandas.tseries.holiday import USFederalHolidayCalendar
 
 from multiprocessing import Pool
 import functools
@@ -42,6 +47,10 @@ def print_elapsed_time(start):
     # remove millis
     elapsed = str(elapsed).split('.')[0]
     print('Elapsed time: {}'.format(elapsed))
+
+
+def get_timestamp_string(ts, ts_format='%Y-%m-%d %H:%M:%S'):
+    return datetime.fromtimestamp(start_time).strftime(ts_format)
 
 
 def calc_datetime_delta(d1, d2, date_format='%Y-%m-%d'):
@@ -135,7 +144,7 @@ def get_train_data(df, date_range=None, differencing=0):
     
     return df
 
-def _get_fft_terms(df, periods=0):
+def _get_fourier_terms(df, periods=0):
     date_range = get_date_range(df)
     date_range = pd.date_range(start=date_range[0], end=date_range[1] + timedelta(days=periods))
 
@@ -167,7 +176,7 @@ def_range = range(0, 4)
 def_s_range = (1, 2, 5, 7)
 @ignore_warnings(category=ConvergenceWarning)
 def optimize_SARIMA(df, p_range=def_range, d=1, q_range=def_range, P_range=def_range, D=1, 
-                    Q_range=def_range, s_range=def_s_range, fft=False, multiprocessing=False):   
+                    Q_range=def_range, s_range=def_s_range, fourier=False, multiprocessing=False):   
     results = []
     best_aic = float('inf')
 
@@ -179,7 +188,7 @@ def optimize_SARIMA(df, p_range=def_range, d=1, q_range=def_range, P_range=def_r
     params = list(product(p_range, q_range, P_range, Q_range, s_range))
     params = [_get_sarima_param(param) for param in params]
     
-    exog_to_train, _ = _get_fft_terms(df) if fft else None
+    exog_to_train, _ = _get_fourier_terms(df) if fourier else None
 
     results = []
     if multiprocessing:
@@ -236,8 +245,8 @@ def pred_demands(train_df, test_df, model_func, forecast_steps=196, train_inst_m
 
 def model_sarima(df, steps, kwargs):
     exog_to_train, exog_to_test = None, None
-    if 'fft' in kwargs and kwargs['fft']:
-        exog_to_train, exog_to_test = _get_fft_terms(df, steps)
+    if 'fourier' in kwargs and kwargs['fourier']:
+        exog_to_train, exog_to_test = _get_fourier_terms(df, steps)
 
     # train
     try: 
@@ -255,15 +264,38 @@ def model_tbats(train_df, steps, kwargs):
     return model.forecast(steps=steps)
 
 
+def _create_sales_lag_feats(df, gpby_cols, target_col, lags):
+    gpby = df.groupby(gpby_cols)
+    for i in lags:
+        df['_'.join([target_col, 'lag', str(i)])] = \
+                gpby[target_col].shift(i).values + np.random.normal(scale=1.6, size=(len(df),))
+    return df
+
+
+def _create_sales_ewm_feats(df, gpby_cols, target_col, alpha=[0.9], shift=[1]):
+    gpby = df.groupby(gpby_cols)
+    for a in alpha:
+        for s in shift:
+            df['_'.join([target_col, 'lag', str(s), 'ewm', str(a)])] = \
+                gpby[target_col].shift(s).ewm(alpha=a).mean().values
+    return df
+
 
 def add_new_features(df):
-    df = df.set_index('date')
-    df['weekday'] = df.index.dayofweek
-    df['is_weekend'] = df['weekday'] >= 4
-    df['day'] = df.index.day
-    df['month'] = df.index.month
-    df['quarter'] = (df.month - 1) / 3
-    df['year'] = df.index.year
+    if df.index.name != 'date':
+        df = df.set_index('date')
+
+    dates = df.index
+    df['weekday'] = dates.dayofweek
+    df['is_weekend'] = (df['weekday'] >= 4).astype(int)
+    df['day'] = dates.day
+    df['day_of_year'] = dates.dayofyear
+    df['is_month_start'] = (dates.is_month_start).astype(int)
+    df['is_month_end'] = (dates.is_month_end).astype(int)
+    df['week_of_year'] = dates.isocalendar().week.astype(int)
+    df['month'] = dates.month
+    df['quarter'] = (df.month - 1) // 3
+    df['year'] = dates.year
 
     # 12 month lag
     prior_year_sales = df.reset_index()[['date','sales','store','item']]
@@ -272,8 +304,42 @@ def add_new_features(df):
     df = df.merge(prior_year_sales, on=['date','store','item'])
 
     # is holiday or not
-    holidays = USFederalHolidayCalendar().holidays(start=df.index.min(), end=df.index.max())
-    df['holiday'] = df.index.isin(holidays)
+    holidays = USFederalHolidayCalendar().holidays(start=df.date.min(), end=df.date.max())
+    df['holiday'] = df.date.isin(holidays).astype(int)
+    
+    df = _create_sales_lag_feats(df, gpby_cols=['store','item'], target_col='sales', 
+                               lags=[91,98,105,112,119,126,182,364])
+
+    df = _create_sales_ewm_feats(df, gpby_cols=['store','item'], 
+                               target_col='sales', 
+                               alpha=[0.95, 0.9, 0.8, 0.7, 0.6, 0.5], 
+                               shift=[91,98,105,112,119,126,182,364,546,728])
+
+    df = df.set_index('date')
+    
+    # convert categorical columns to numerics
+    #num_cols = ['sales', '12m_lag']
+    #cat_cols = [col for col in df.keys() if col not in num_cols]
+    cat_cols=['store', 'item', 'weekday', 'month', 'quarter', 'day', 'day_of_year', 'week_of_year', 'year']
+    df = pd.get_dummies(df, columns=cat_cols)
+
+    print(list(df.keys()))
+
+    return df
+
+
+def split_features_labels(df):
+    X_train = df.drop(columns=['sales'])
+    y_train = df[['sales']].values.ravel()
+    return X_train, y_train
+
+
+def plot_corr(df, method='spearman', size=10):
+    corr = df.corr(method=method)
+    sns.set(rc={'figure.figsize':(size+1,size)})
+    ax = sns.heatmap(corr, cmap='Greens', annot=True)
+    bottom, top = ax.get_ylim()
+    ax.set_ylim(bottom + 0.5, top - 0.5)
 
 
 
@@ -281,6 +347,7 @@ if __name__ == "__main__":
     
     visualize = False
     stationary_check = False
+    pred_count = 365
 
     # ## Explore data
     # ### Read input data
@@ -295,19 +362,16 @@ if __name__ == "__main__":
     train_df = orig_train_df.copy()
     train_df.columns = ['date', 'store', 'item', 'sales']
 
-
+    train_df.date = pd.to_datetime(train_df.date)
     train_df = group_demand_by(train_df, ['date', 'item', 'store'])
 
     # remove NA
     train_df.dropna(inplace=True)
     print('After: ' + str(train_df.shape))
 
-
-
     print('Date range: ')
     date_range = get_date_range(train_df, debugging=True)
     train_df.drop('date', axis=1).describe(include='all').iloc[:4,:]
-
 
 
     # ## Exploratory time-series analysis
@@ -386,42 +450,42 @@ if __name__ == "__main__":
         pred_sarima.pred = pred_sarima.pred.apply(lambda pred: np.fromstring(pred, dtype=float, sep=' '))
     else:
         print('{} does not exist. Running SARIMA...'.format(sarima_pred_filepath))
-        pred_sarima = pred_demands(train_df, test_df, model_sarima, 365, kwargs=sarima_param)
+        pred_sarima = pred_demands(train_df, test_df, model_sarima, pred_count, kwargs=sarima_param)
         pred_sarima.to_csv(sarima_pred_filepath, index=False)
 
 
 
-    # SARIMA model with FFT
-    sarima_fft_params_filepath = "sarima_fft_params.csv"
-    if Path(sarima_fft_params_filepath).is_file():
-        print('Reading from {}...'.format(sarima_fft_params_filepath))
-        tried_models = pd.read_csv(sarima_fft_params_filepath)
+    # SARIMA model with FOURIER
+    sarima_fourier_params_filepath = "sarima_fourier_params.csv"
+    if Path(sarima_fourier_params_filepath).is_file():
+        print('Reading from {}...'.format(sarima_fourier_params_filepath))
+        tried_models = pd.read_csv(sarima_fourier_params_filepath)
         tried_models.param = tried_models.param.apply(lambda param: literal_eval(param))
     else:
-        print('{} does not exist. Finding best SARIMA with FFT model...'.format(sarima_fft_params_filepath))
-        tried_models = optimize_SARIMA(item_df, d=d, D=D, fft=True, multiprocessing=True)
-        tried_models.to_csv(sarima_fft_params_filepath, index=False)
+        print('{} does not exist. Finding best SARIMA with FOURIER model...'.format(sarima_fourier_params_filepath))
+        tried_models = optimize_SARIMA(item_df, d=d, D=D, fourier=True, multiprocessing=True)
+        tried_models.to_csv(sarima_fourier_params_filepath, index=False)
 
 
-    print('Parameters of best SARIMA with FFT:')
+    print('Parameters of best SARIMA with FOURIER:')
     order, seasonal_order = tried_models.param[0]
-    sarima_fft_param = {'order': order, 'seasonal_order': seasonal_order}
-    print(sarima_fft_param)
+    sarima_fourier_param = {'order': order, 'seasonal_order': seasonal_order}
+    print(sarima_fourier_param)
 
 
-    sarima_fft_pred_filepath = 'sarima_fft_prediction.csv'
-    if Path(sarima_fft_pred_filepath).is_file():
-        print('Reading from {}...'.format(sarima_fft_pred_filepath))
-        pred_sarima_fft = pd.read_csv(sarima_fft_pred_filepath)
-        pred_sarima_fft.pred = pred_sarima_fft.pred.apply(lambda pred: np.fromstring(pred, dtype=float, sep=' '))
+    sarima_fourier_pred_filepath = 'sarima_fourier_prediction.csv'
+    if Path(sarima_fourier_pred_filepath).is_file():
+        print('Reading from {}...'.format(sarima_fourier_pred_filepath))
+        pred_sarima_fourier = pd.read_csv(sarima_fourier_pred_filepath)
+        pred_sarima_fourier.pred = pred_sarima_fourier.pred.apply(lambda pred: np.fromstring(pred, dtype=float, sep=' '))
     else:
-        print('{} does not exist. Running SARIMA with FFT...'.format(sarima_fft_pred_filepath))
-        # indicate Fft transformation
-        sarima_fft_param = sarima_param.copy()
-        sarima_fft_param['fft'] = True
+        print('{} does not exist. Running SARIMA with FOURIER...'.format(sarima_fourier_pred_filepath))
+        # indicate Fourier transformation
+        sarima_fourier_param = sarima_param.copy()
+        sarima_fourier_param['fourier'] = True
         # train model
-        pred_sarima_fft = pred_demands(train_df, test_df, model_sarima, 365, kwargs=sarima_fft_param)
-        pred_sarima_fft.to_csv(sarima_fft_pred_filepath, index=False)
+        pred_sarima_fourier = pred_demands(train_df, test_df, model_sarima, pred_count, kwargs=sarima_fourier_param)
+        pred_sarima_fourier.to_csv(sarima_fourier_pred_filepath, index=False)
 
 
 
@@ -435,34 +499,74 @@ if __name__ == "__main__":
     else:
         print('{} does not exist. Running TBATS...'.format(tbats_pred_filepath))
         # apparently, tbats already uses multiprocessing underneath
-        pred_tbats = pred_demands(train_df, test_df, model_tbats, 365, multiprocessing=True) 
+        pred_tbats = pred_demands(train_df, test_df, model_tbats, pred_count, multiprocessing=True) 
         pred_tbats.to_csv(tbats_pred_filepath, index=False)
 
+
+
+    # read the test file
+    test_df = pd.read_csv('dataset/demand-forecasting-kernels-only/test.csv', index_col='id')
+    test_size = calc_datetime_delta(*get_date_range(test_df))
+    test_df.date = pd.to_datetime(test_df.date)
+    first_test_date = test_df.date.min()
+
+
+    # ## XGBoost
+    # add features to train and test file
+    xgb_pred_filepath = 'xgb_prediction.csv'
+    if Path(xgb_pred_filepath).is_file():
+        print('Reading from {}...'.format(xgb_pred_filepath))
+        pred_xgb = np.loadtxt(xgb_pred_filepath)
+    else:
+        print('{} does not exist. Running XGBoost...'.format(xgb_pred_filepath))
+        
+        start_time = time()
+        print('Start time: ' + get_timestamp_string(start_time))
+
+        # adding new features
+        full_df = pd.concat([train_df, test_df])
+        full_df = add_new_features(full_df)
+        train_added_df = full_df[full_df.index < first_test_date]
+        test_added_df = full_df[full_df.index >= first_test_date]
+
+        # split into features and labels
+        X_train, y_train = split_features_labels(train_added_df)
+        X_test, _ = split_features_labels(test_added_df)
+
+        # build XGBoost model
+        # xgb_model = XGBRegressor(tree_method='gpu_hist', n_jobs=PROCESS_COUNT, verbosity=3)
+        xgb_model = XGBRegressor(n_jobs=PROCESS_COUNT, verbosity=3)
+        xgb_model.fit(X_train, y_train)
+        # predict
+        pred_xgb = xgb_model.predict(X_test)
+        np.savetxt(xgb_pred_filepath, pred_xgb, delimiter=",")
+        # save model
+        joblib.dump(xgb_model, 'xgb_model.pkl', compress=9)
+
+        print_elapsed_time(start_time)
 
 
     # testing
     submissions_filepath = 'submissions.csv'
     if not Path(submissions_filepath).is_file():
-        # read the test file
-        test_df = pd.read_csv('dataset/demand-forecasting-kernels-only/test.csv', index_col='id')
-        test_size = calc_datetime_delta(*get_date_range(test_df))
-        test_df.date = pd.to_datetime(test_df.date)
-        first_test_date = test_df.date.min()
-
         #TODO: consider refactoring this
         # iterate each test case, and find its prediction
-        pred_dfs = {'sarima': pred_sarima, 'sarima_fft': pred_sarima_fft, 'tbats': pred_tbats}
-        def combine_prediction(row):
-            index = (row.date - first_test_date).days
+        pred_dfs = {'sarima': pred_sarima, 'sarima_fourier': pred_sarima_fourier, 'tbats': pred_tbats, 'xgb': pred_xgb}
+        def combine_prediction(input):
+            index, row = input
+            offset = (row.date - first_test_date).days
             result = []
             for name, pred_df in pred_dfs.items():
-                df = filter_demand(pred_df, store=row.store, item=row['item'])
-                result.append(df.pred.values[0][index])
+                if isinstance(pred_df, pd.DataFrame):
+                    df = filter_demand(pred_df, store=row.store, item=row['item'])
+                    result.append(df.pred.values[0][offset])
+                else:
+                    result.append(pred_df[index])
             return result
 
         # distribute the workload
         with Pool(PROCESS_COUNT) as p:
-            rows_iter = (row for _, row in test_df.iterrows())
+            rows_iter = ((index, row) for index, row in test_df.iterrows())
             submissions = list(tqdm(p.imap(combine_prediction, rows_iter), total=test_df.shape[0]))
             submissions = pd.DataFrame(submissions, columns=pred_dfs.keys())
             submissions.index.name = 'id'
