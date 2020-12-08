@@ -320,10 +320,10 @@ def add_new_features(df):
     # convert categorical columns to numerics
     #num_cols = ['sales', '12m_lag']
     #cat_cols = [col for col in df.keys() if col not in num_cols]
-    cat_cols=['store', 'item', 'weekday', 'month', 'quarter', 'day', 'day_of_year', 'week_of_year', 'year']
+    cat_cols=['store', 'item', 'weekday', 'month', 'quarter']
     df = pd.get_dummies(df, columns=cat_cols)
 
-    print(list(df.keys()))
+    # print(list(df.keys()))
 
     return df
 
@@ -332,6 +332,40 @@ def split_features_labels(df):
     X_train = df.drop(columns=['sales'])
     y_train = df[['sales']].values.ravel()
     return X_train, y_train
+
+
+def smape(A, F):
+    return 100/len(A) * np.sum(2 * np.abs(F - A) / (np.abs(A) + np.abs(F)))
+
+
+def tune_xgb(train_df):
+    cutoff_date = '2017-10-01'
+    validation_df = train_df[train_df.index >= cutoff_date]
+    train_df = train_df[train_df.index < cutoff_date]
+
+    X_train, y_train = split_features_labels(train_df)
+    X_test, y_test = split_features_labels(validation_df)
+
+    n_estimators = range(50, 400, 100) 
+    eta = (0.01, 0.05, 0.10)
+    max_depth = (6, 10)
+    # min_child_weight = (1, 3, 5)
+    gamma = (.0, .1, .2)
+    params = list(product(n_estimators, eta, max_depth, gamma))
+
+    result = []
+    for param in tqdm(params):
+        # build XGBoost model
+        xgb_model = XGBRegressor(n_estimators = param[0], learning_rate=param[1], max_depth=param[2], gamma=param[3])
+        xgb_model.fit(X_train, y_train)
+        # predict
+        pred_xgb = xgb_model.predict(X_test)
+        # evaluate
+        eval_smape = smape(pred_xgb, y_test)
+        result.append([param, eval_smape])
+
+    result = pd.DataFrame(result, columns=['param', 'smape']).sort_values('smape')
+    return result.reset_index(drop=True)
 
 
 def plot_corr(df, method='spearman', size=10):
@@ -351,7 +385,7 @@ if __name__ == "__main__":
 
     # ## Explore data
     # ### Read input data
-    orig_train_df = pd.read_csv('dataset/demand-forecasting-kernels-only/train.csv')
+    orig_train_df = pd.read_csv('dataset/train.csv')
     print('Original: ' + str(orig_train_df.shape))
     orig_train_df
 
@@ -424,7 +458,7 @@ if __name__ == "__main__":
     d = 1
     D = 0
 
-    tried_params_filepath = "sarima_params.csv"
+    tried_params_filepath = "backup/sarima_params.csv"
     if Path(tried_params_filepath).is_file():
         print('Reading from {}...'.format(tried_params_filepath))
         tried_models = pd.read_csv(tried_params_filepath)
@@ -443,7 +477,7 @@ if __name__ == "__main__":
 
 
     # ### Build SARIMA model
-    sarima_pred_filepath = 'sarima_prediction.csv'
+    sarima_pred_filepath = 'backup/sarima_prediction.csv'
     if Path(sarima_pred_filepath).is_file():
         print('Reading from {}...'.format(sarima_pred_filepath))
         pred_sarima = pd.read_csv(sarima_pred_filepath)
@@ -456,7 +490,7 @@ if __name__ == "__main__":
 
 
     # SARIMA model with FOURIER
-    sarima_fourier_params_filepath = "sarima_fourier_params.csv"
+    sarima_fourier_params_filepath = "backup/sarima_fourier_params.csv"
     if Path(sarima_fourier_params_filepath).is_file():
         print('Reading from {}...'.format(sarima_fourier_params_filepath))
         tried_models = pd.read_csv(sarima_fourier_params_filepath)
@@ -473,7 +507,7 @@ if __name__ == "__main__":
     print(sarima_fourier_param)
 
 
-    sarima_fourier_pred_filepath = 'sarima_fourier_prediction.csv'
+    sarima_fourier_pred_filepath = 'backup/sarima_fourier_prediction.csv'
     if Path(sarima_fourier_pred_filepath).is_file():
         print('Reading from {}...'.format(sarima_fourier_pred_filepath))
         pred_sarima_fourier = pd.read_csv(sarima_fourier_pred_filepath)
@@ -491,7 +525,7 @@ if __name__ == "__main__":
 
     # ## TBATS
     # Trigonometric seasonality, Box-Cox transformation, ARMA errors, Trend and Seasonal components.
-    tbats_pred_filepath = 'tbats_prediction.csv'
+    tbats_pred_filepath = 'backup/tbats_prediction.csv'
     if Path(tbats_pred_filepath).is_file():
         print('Reading from {}...'.format(tbats_pred_filepath))
         pred_tbats = pd.read_csv(tbats_pred_filepath)
@@ -505,7 +539,7 @@ if __name__ == "__main__":
 
 
     # read the test file
-    test_df = pd.read_csv('dataset/demand-forecasting-kernels-only/test.csv', index_col='id')
+    test_df = pd.read_csv('dataset/test.csv', index_col='id')
     test_size = calc_datetime_delta(*get_date_range(test_df))
     test_df.date = pd.to_datetime(test_df.date)
     first_test_date = test_df.date.min()
@@ -528,6 +562,19 @@ if __name__ == "__main__":
         full_df = add_new_features(full_df)
         train_added_df = full_df[full_df.index < first_test_date]
         test_added_df = full_df[full_df.index >= first_test_date]
+
+
+        # tune parameters
+        xgb_params_filepath = "xgb_params.csv"
+        if Path(xgb_params_filepath).is_file():
+            print('Reading from {}...'.format(xgb_params_filepath))
+            xgb_params = pd.read_csv(xgb_params_filepath)
+            xgb_params.param = xgb_params.param.apply(lambda param: literal_eval(param))
+        else:
+            print('{} does not exist. Finding best SARIMA model...'.format(xgb_params_filepath))
+            xgb_params = tune_xgb(train_added_df)
+            xgb_params.to_csv(xgb_params_filepath, index=False)
+
 
         # split into features and labels
         X_train, y_train = split_features_labels(train_added_df)
